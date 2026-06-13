@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=DDC Brightness
+Comment=Control external monitor brightness via DDC/CI
+Exec=ddc_brightness
+Icon=video-display
+Terminal=false
+Type=Application
+Categories=Utility;HardwareSettings;
+StartupNotify=false
