@@ -1,5 +1,3 @@
-# Maintainer: Tomás Barros <tomasbarros1@gmail.com>
-
 pkgname=ddc_brightness
 pkgver=0.1.1
 pkgrel=1
