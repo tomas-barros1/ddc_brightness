@@ -8,7 +8,7 @@ use crate::ddc;
 use crate::models::monitor::Monitor;
 
 enum UIMessage {
-    MonitorsDetected(Vec<Monitor>),
+    MonitorsDetected(Vec<Monitor>, Option<(u8, u8)>),
     BrightnessRead(u8, u8),
     BrightnessSet,
     Error(String),
@@ -24,6 +24,24 @@ pub fn build_window(app: &adw::Application) {
     let (sender, receiver) = mpsc::channel::<UIMessage>();
     let receiver = Rc::new(RefCell::new(receiver));
 
+    // --- Start detection before any UI work (I/O runs in background while we build widgets) ---
+    let detect_sender = sender.clone();
+    std::thread::spawn(move || {
+        let msg = match ddc::detect::detect_monitors() {
+            Ok(list) => {
+                let brightness = if !list.is_empty() {
+                    ddc::brightness::read_brightness(list[0].display_number).ok()
+                } else {
+                    None
+                };
+                UIMessage::MonitorsDetected(list, brightness)
+            }
+            Err(e) => UIMessage::Error(e),
+        };
+        detect_sender.send(msg).ok();
+    });
+
+    // --- Build minimal window skeleton ---
     let window = adw::ApplicationWindow::new(app);
     window.set_title(Some("DDC Brightness"));
     window.set_default_size(380, 200);
@@ -115,7 +133,7 @@ pub fn build_window(app: &adw::Application) {
             };
 
             match msg {
-                UIMessage::MonitorsDetected(list) => {
+                UIMessage::MonitorsDetected(list, brightness) => {
                     *m_monitors.borrow_mut() = list;
                     let mon_list = m_monitors.borrow();
 
@@ -131,15 +149,25 @@ pub fn build_window(app: &adw::Application) {
                         let display = mon_list[0].display_number;
                         *m_selected.borrow_mut() = Some(display);
 
-                        m_spinner.start();
-                        m_scale.set_sensitive(false);
-                        let s = m_sender.clone();
-                        std::thread::spawn(move || {
-                            match ddc::brightness::read_brightness(display) {
-                                Ok((cur, max)) => s.send(UIMessage::BrightnessRead(cur, max)).ok(),
-                                Err(e) => s.send(UIMessage::Error(e)).ok(),
-                            };
-                        });
+                        if let Some((cur, max)) = brightness {
+                            m_scale.set_range(0.0, max as f64);
+                            m_scale.set_value(cur as f64);
+                            m_percentage.set_text(&format!("{}%", cur));
+                            m_scale.set_sensitive(true);
+                            m_spinner.stop();
+                        } else {
+                            m_spinner.start();
+                            m_scale.set_sensitive(false);
+                            let s = m_sender.clone();
+                            std::thread::spawn(move || {
+                                match ddc::brightness::read_brightness(display) {
+                                    Ok((cur, max)) => {
+                                        s.send(UIMessage::BrightnessRead(cur, max)).ok()
+                                    }
+                                    Err(e) => s.send(UIMessage::Error(e)).ok(),
+                                };
+                            });
+                        }
                     }
                 }
                 UIMessage::BrightnessRead(current, max) => {
@@ -236,15 +264,6 @@ pub fn build_window(app: &adw::Application) {
             },
         );
         *sld_debounce.borrow_mut() = Some(id);
-    });
-
-    // --- Initial monitor detection ---
-    let s = sender.clone();
-    std::thread::spawn(move || {
-        match ddc::detect::detect_monitors() {
-            Ok(monitors) => s.send(UIMessage::MonitorsDetected(monitors)).ok(),
-            Err(e) => s.send(UIMessage::Error(e)).ok(),
-        };
     });
 
     window.present();

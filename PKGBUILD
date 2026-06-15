@@ -1,15 +1,15 @@
-# Maintainer: Your Name <your.email@example.com>
+# Maintainer: Tomás Barros <tomasbarros1@gmail.com>
 
 pkgname=ddc_brightness
-pkgver=0.1.0
+pkgver=0.1.1
 pkgrel=1
 pkgdesc="Lightweight desktop application for controlling monitor brightness via DDC/CI"
 arch=('x86_64')
-url="https://github.com/yourusername/ddc_brightness"
+url="https://github.com/tomas-barros1/ddc_brightness"
 license=('MIT')
 depends=('ddcutil' 'gtk4' 'libadwaita')
 makedepends=('cargo')
-source=("$pkgname-$pkgver.tar.gz::https://github.com/yourusername/ddc_brightness/archive/v$pkgver.tar.gz")
+source=("$pkgname-$pkgver.tar.gz::https://github.com/tomas-barros1/ddc_brightness/archive/v$pkgver.tar.gz")
 sha256sums=('SKIP')
 
 build() {
