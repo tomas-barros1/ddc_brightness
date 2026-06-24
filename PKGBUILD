@@ -1,5 +1,5 @@
 pkgname=ddc_brightness
-pkgver=0.1.1
+pkgver=0.1.2
 pkgrel=1
 pkgdesc="Lightweight desktop application for controlling monitor brightness via DDC/CI"
 arch=('x86_64')

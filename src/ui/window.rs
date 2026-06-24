@@ -1,6 +1,8 @@
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
+use std::sync::Arc;
 
 use adw::prelude::*;
 
@@ -20,11 +22,15 @@ pub fn build_window(app: &adw::Application) {
     let debounce_source: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
     let is_setting_value: Rc<RefCell<bool>> = Rc::new(RefCell::new(false));
     let is_initializing: Rc<RefCell<bool>> = Rc::new(RefCell::new(true));
+    let is_syncing: Rc<RefCell<bool>> = Rc::new(RefCell::new(false));
 
     let (sender, receiver) = mpsc::channel::<UIMessage>();
     let receiver = Rc::new(RefCell::new(receiver));
 
-    // --- Start detection before any UI work (I/O runs in background while we build widgets) ---
+    // --- Serialize ddcutil setvcp calls to prevent I2C bus races ---
+    let setting_flag = Arc::new(AtomicBool::new(false));
+
+    // --- Start detection before any UI work ---
     let detect_sender = sender.clone();
     std::thread::spawn(move || {
         let msg = match ddc::detect::detect_monitors() {
@@ -41,7 +47,7 @@ pub fn build_window(app: &adw::Application) {
         detect_sender.send(msg).ok();
     });
 
-    // --- Build minimal window skeleton ---
+    // --- Build window ---
     let window = adw::ApplicationWindow::new(app);
     window.set_title(Some("DDC Brightness"));
     window.set_default_size(380, 200);
@@ -62,13 +68,21 @@ pub fn build_window(app: &adw::Application) {
         .build();
 
     let scale = gtk::Scale::with_range(gtk::Orientation::Horizontal, 0.0, 100.0, 1.0);
-    scale.set_draw_value(false);
     scale.set_hexpand(true);
     scale.set_sensitive(false);
 
-    let percentage_label = gtk::Label::new(Some("--%"));
-    percentage_label.set_halign(gtk::Align::Center);
-    percentage_label.add_css_class("heading");
+    let spin_button = gtk::SpinButton::with_range(0.0, 100.0, 1.0);
+    spin_button.set_halign(gtk::Align::End);
+    spin_button.set_sensitive(false);
+    spin_button.set_width_chars(3);
+
+    let percent_label = gtk::Label::new(Some("%"));
+    percent_label.set_halign(gtk::Align::Start);
+
+    let value_box = gtk::Box::new(gtk::Orientation::Horizontal, 2);
+    value_box.set_halign(gtk::Align::Center);
+    value_box.append(&spin_button);
+    value_box.append(&percent_label);
 
     let brightness_box = gtk::Box::new(gtk::Orientation::Vertical, 8);
     brightness_box.set_margin_top(12);
@@ -76,7 +90,7 @@ pub fn build_window(app: &adw::Application) {
     brightness_box.set_margin_start(12);
     brightness_box.set_margin_end(12);
     brightness_box.append(&scale);
-    brightness_box.append(&percentage_label);
+    brightness_box.append(&value_box);
 
     let brightness_row = adw::PreferencesRow::new();
     brightness_row.set_child(Some(&brightness_box));
@@ -118,7 +132,7 @@ pub fn build_window(app: &adw::Application) {
     let m_string_list = string_list.clone();
     let m_combo = combo_row.clone();
     let m_scale = scale.clone();
-    let m_percentage = percentage_label.clone();
+    let m_spin = spin_button.clone();
     let m_spinner = spinner.clone();
     let m_toast = toast_overlay.clone();
     let m_sender = sender.clone();
@@ -152,12 +166,15 @@ pub fn build_window(app: &adw::Application) {
                         if let Some((cur, max)) = brightness {
                             m_scale.set_range(0.0, max as f64);
                             m_scale.set_value(cur as f64);
-                            m_percentage.set_text(&format!("{}%", cur));
+                            m_spin.set_range(0.0, max as f64);
+                            m_spin.set_value(cur as f64);
                             m_scale.set_sensitive(true);
+                            m_spin.set_sensitive(true);
                             m_spinner.stop();
                         } else {
                             m_spinner.start();
                             m_scale.set_sensitive(false);
+                            m_spin.set_sensitive(false);
                             let s = m_sender.clone();
                             std::thread::spawn(move || {
                                 match ddc::brightness::read_brightness(display) {
@@ -174,13 +191,16 @@ pub fn build_window(app: &adw::Application) {
                     *m_is_setting.borrow_mut() = true;
                     m_scale.set_range(0.0, max as f64);
                     m_scale.set_value(current as f64);
+                    m_spin.set_range(0.0, max as f64);
+                    m_spin.set_value(current as f64);
                     *m_is_setting.borrow_mut() = false;
-                    m_percentage.set_text(&format!("{}%", current));
                     m_scale.set_sensitive(true);
+                    m_spin.set_sensitive(true);
                     m_spinner.stop();
                 }
                 UIMessage::Error(err) => {
                     m_scale.set_sensitive(true);
+                    m_spin.set_sensitive(true);
                     m_spinner.stop();
                     let toast = adw::Toast::new(&err);
                     m_toast.add_toast(toast);
@@ -197,6 +217,7 @@ pub fn build_window(app: &adw::Application) {
     let sel_selected = selected_display.clone();
     let sel_spinner = spinner.clone();
     let sel_scale = scale.clone();
+    let sel_spin = spin_button.clone();
     let sel_sender = sender.clone();
 
     combo_row.connect_selected_notify(move |row| {
@@ -215,6 +236,7 @@ pub fn build_window(app: &adw::Application) {
 
         sel_spinner.start();
         sel_scale.set_sensitive(false);
+        sel_spin.set_sensitive(false);
         let s = sel_sender.clone();
         std::thread::spawn(move || {
             match ddc::brightness::read_brightness(display) {
@@ -224,16 +246,21 @@ pub fn build_window(app: &adw::Application) {
         });
     });
 
-    // --- Slider with debounce ---
-    let sld_percentage = percentage_label.clone();
+    // --- Slider changes → update spin button + debounce ---
+    let sld_syncing = is_syncing.clone();
+    let sld_spin = spin_button.clone();
     let sld_is_setting = is_setting_value.clone();
     let sld_selected = selected_display.clone();
     let sld_debounce = debounce_source.clone();
     let sld_sender = sender.clone();
+    let sld_flag = setting_flag.clone();
 
     scale.connect_value_changed(move |s| {
         let val = s.value() as u8;
-        sld_percentage.set_text(&format!("{}%", val));
+
+        *sld_syncing.borrow_mut() = true;
+        sld_spin.set_value(val as f64);
+        *sld_syncing.borrow_mut() = false;
 
         if *sld_is_setting.borrow() {
             return;
@@ -250,21 +277,166 @@ pub fn build_window(app: &adw::Application) {
 
         let ds = sld_debounce.clone();
         let ss = sld_sender.clone();
+        let sf = sld_flag.clone();
 
         let id = glib::timeout_add_local_once(
             std::time::Duration::from_millis(200),
             move || {
                 *ds.borrow_mut() = None;
                 std::thread::spawn(move || {
+                    if sf.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() {
+                        return;
+                    }
                     match ddc::brightness::set_brightness(display, val) {
-                        Ok(_) => ss.send(UIMessage::BrightnessSet).ok(),
-                        Err(e) => ss.send(UIMessage::Error(e)).ok(),
+                        Ok(_) => {
+                            sf.store(false, Ordering::SeqCst);
+                            ss.send(UIMessage::BrightnessSet).ok();
+                        }
+                        Err(e) => {
+                            sf.store(false, Ordering::SeqCst);
+                            ss.send(UIMessage::Error(e)).ok();
+                        }
                     };
                 });
             },
         );
         *sld_debounce.borrow_mut() = Some(id);
     });
+
+    // --- Spin button changes → update slider (triggers slider's debounce) ---
+    let sp_syncing = is_syncing.clone();
+    let sp_is_setting = is_setting_value.clone();
+    let sp_scale = scale.clone();
+    let sp_selected = selected_display.clone();
+    let sp_debounce = debounce_source.clone();
+    let sp_sender = sender.clone();
+    let sp_flag = setting_flag.clone();
+
+    spin_button.connect_value_changed(move |sb| {
+        if *sp_syncing.borrow() {
+            return;
+        }
+
+        let val = sb.value() as u8;
+
+        *sp_is_setting.borrow_mut() = true;
+        sp_scale.set_value(val as f64);
+        *sp_is_setting.borrow_mut() = false;
+
+        if let Some(id) = sp_debounce.borrow_mut().take() {
+            id.remove();
+        }
+
+        let display = match *sp_selected.borrow() {
+            Some(d) => d,
+            None => return,
+        };
+
+        let ds = sp_debounce.clone();
+        let ss = sp_sender.clone();
+        let sf = sp_flag.clone();
+
+        let id = glib::timeout_add_local_once(
+            std::time::Duration::from_millis(200),
+            move || {
+                *ds.borrow_mut() = None;
+                std::thread::spawn(move || {
+                    if sf.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() {
+                        return;
+                    }
+                    match ddc::brightness::set_brightness(display, val) {
+                        Ok(_) => {
+                            sf.store(false, Ordering::SeqCst);
+                            ss.send(UIMessage::BrightnessSet).ok();
+                        }
+                        Err(e) => {
+                            sf.store(false, Ordering::SeqCst);
+                            ss.send(UIMessage::Error(e)).ok();
+                        }
+                    };
+                });
+            },
+        );
+        *sp_debounce.borrow_mut() = Some(id);
+    });
+
+    // --- Mouse wheel on slider ---
+    let scroll = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::BOTH_AXES);
+    let sc_scale = scale.clone();
+    scroll.connect_scroll(move |_ctrl, _dx, dy| {
+        if dy == 0.0 {
+            return glib::Propagation::Proceed;
+        }
+        let adj = sc_scale.adjustment();
+        let step = 5.0;
+        let current = adj.value();
+        let new_val = (current - dy * step).clamp(adj.lower(), adj.upper());
+        if (new_val - current).abs() < 0.5 {
+            return glib::Propagation::Stop;
+        }
+        sc_scale.set_value(new_val);
+        glib::Propagation::Stop
+    });
+    scale.add_controller(scroll);
+
+    // --- Keyboard shortcuts ---
+    let key_controller = gtk::EventControllerKey::new();
+    let kc_scale = scale.clone();
+    let kc_spin = spin_button.clone();
+    let kc_display = selected_display.clone();
+    let kc_debounce = debounce_source.clone();
+    let kc_flag = setting_flag.clone();
+    key_controller.connect_key_pressed(move |_ctrl, keyval, _code, _state| {
+        let adj = kc_scale.adjustment();
+        let current = adj.value();
+        let step = 5.0;
+
+        let new_val = match keyval {
+            gtk::gdk::Key::Up | gtk::gdk::Key::KP_Up => {
+                (current + step).clamp(adj.lower(), adj.upper())
+            }
+            gtk::gdk::Key::Down | gtk::gdk::Key::KP_Down => {
+                (current - step).clamp(adj.lower(), adj.upper())
+            }
+            gtk::gdk::Key::Return | gtk::gdk::Key::KP_Enter => {
+                if !kc_spin.has_focus() {
+                    return glib::Propagation::Proceed;
+                }
+                if let Some(id) = kc_debounce.borrow_mut().take() {
+                    id.remove();
+                }
+                let display = match *kc_display.borrow() {
+                    Some(d) => d,
+                    None => return glib::Propagation::Stop,
+                };
+                let val = kc_spin.value() as u8;
+                let sf = kc_flag.clone();
+                std::thread::spawn(move || {
+                    if sf.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() {
+                        return;
+                    }
+                    match ddc::brightness::set_brightness(display, val) {
+                        Ok(_) => sf.store(false, Ordering::SeqCst),
+                        Err(e) => {
+                            sf.store(false, Ordering::SeqCst);
+                            // Enter handler has no channel sender, ignore errors
+                            let _ = e;
+                        }
+                    };
+                });
+                return glib::Propagation::Stop;
+            }
+            _ => return glib::Propagation::Proceed,
+        };
+
+        if (new_val - current).abs() < 0.5 {
+            return glib::Propagation::Stop;
+        }
+
+        kc_scale.set_value(new_val);
+        glib::Propagation::Stop
+    });
+    window.add_controller(key_controller);
 
     window.present();
 }
